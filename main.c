@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#define CL_USE_DEPRECATED_OPENCL_1_2_APIS
 #include <CL/cl.h>
 #include <stdio.h>
 #define GLEW_STATIC
@@ -8,14 +9,19 @@
 
 #include <complex>
 
-unsigned char img[512 * 512 * 3];
+float img_[512 * 512 * 3];
+unsigned int img[512 * 512 * 3];
+unsigned int max_r = 0;
+unsigned int max_g = 0;
+unsigned int max_b = 0;
+cl_float2 output_results_data[512 * 2048];
 
 float mandelbrot(std::complex<float> c, int limit) {
   std::complex<float> z = 0;
   int i = 0;
   for (; i < limit; i++) {
     z = z * z + c;
-    if (std::abs(z) > 2) {
+    if (std::abs(z) > 3) {
       return i * 1. / limit;
     }
   }
@@ -26,11 +32,11 @@ int buddhabrot(std::complex<float> c, std::complex<float> *t, int limit) {
   std::complex<float> z = 0;
   int i = 0;
   for (; i < limit; i++) {
+    if (std::abs(z) > 3) {
+      return i;
+    }
     z = z * z + c;
     t[i] = z;
-    if (std::abs(z) > 2) {
-      return i + 1;
-    }
   }
   return limit;
 }
@@ -43,6 +49,8 @@ int main() {
   clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL);
 
   cl_context context = clCreateContext(NULL, 1, &device, NULL, NULL, NULL);
+
+  cl_command_queue queue = clCreateCommandQueue(context, device, 0, NULL);
 
   char buf[1000];
 
@@ -58,6 +66,7 @@ int main() {
   clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(units), &units, NULL);
   printf("Computing Units: %d\n", units);
 
+  srand(time(NULL));
   glfwInit();
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
@@ -123,6 +132,54 @@ int main() {
     }
   )";
 
+  const char* kernel_source = R"(
+    inline float2 mul(float2 a, float2 b) {
+      return ((float2)(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x));
+    }
+
+    inline float cabs(float2 a) {
+      return sqrt(a.x * a.x + a.y * a.y);
+    }
+
+    __kernel void buddhabrot(__global float2* c, int limit, __global int* steps, __global float2* results) {
+      int id = get_global_id(0);
+      float2 z = ((float2)(0, 0));
+      int i = 0;
+      for (; i < limit; i++) {
+        if (cabs(z) > 3) {
+          steps[id] = i;
+          break;
+        }
+        z = mul(z, z) + c[id];
+        results[id * limit + i] = z;
+      }
+      steps[id] = i;
+    }
+  )";
+
+  cl_program program = clCreateProgramWithSource(context, 1, &kernel_source, NULL, NULL);
+  int err = clBuildProgram(program, 0, NULL, NULL, NULL, NULL);
+  if (err != CL_SUCCESS) {
+    char buffer[20000];
+    printf("Error: Failed to build OpenCL program! (%d)\n", err);
+    clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, sizeof(buffer), buffer, NULL);
+    printf("%s\n", buffer);
+    exit(1);
+  }
+  cl_kernel kernel = clCreateKernel(program, "buddhabrot", &err);
+  if (err != CL_SUCCESS) {
+    printf("Error: Cannot create compute kernel!\n");
+    exit(1);
+  }
+
+  cl_mem input_c = clCreateBuffer(context,  CL_MEM_READ_ONLY,  sizeof(cl_float2) * 512, NULL, NULL);
+  cl_mem output_steps = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(int) * 512, NULL, NULL);
+  cl_mem output_results = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(cl_float2) * 512 * 2048, NULL, NULL);
+
+  clSetKernelArg(kernel, 0, sizeof(cl_mem), &input_c);
+  clSetKernelArg(kernel, 2, sizeof(cl_mem), &output_steps);
+  clSetKernelArg(kernel, 3, sizeof(cl_mem), &output_results);
+
   GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
   glShaderSource(vertex_shader, 1, &vertex_source, NULL);
   glCompileShader(vertex_shader);
@@ -166,65 +223,146 @@ int main() {
   {
     if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
       glfwSetWindowShouldClose(window, GL_TRUE);
-    /*
+
+#ifdef MANDELBROT
     for (int j = 0; j < 512; j++) {
       std::complex<float> c = std::complex<float>(j / 512. * 3 - 2.25, i / 512. * 3 - 1.5);
-      float f = mandelbrot(c, 128);
+      float f = mandelbrot(c, 256);
       int color = f * 255;
       img[(i * 512 + j) * 3 + 0] = img[(i * 512 + j) * 3 + 1] = img[(i * 512 + j) * 3 + 2] = color;
     }
-    */
+#endif
 
+#ifdef CPU
     for (int j = 0; j < 512; j++) {
-      std::complex<float> t[4096];
+      const int sr = 512;
+      const int sg = 1024;
+      const int sb = 2048;
+      std::complex<float> r[sr];
+      std::complex<float> g[sg];
+      std::complex<float> b[sb];
       float ri = i + (rand() * 1. / RAND_MAX - 0.5); // rand() % 512;
       float rj = j + (rand() * 1. / RAND_MAX - 0.5); // rand() % 512;
-      int steps;
       std::complex<float> c = std::complex<float>(rj / 512. * 3 - 2.25, ri / 512. * 3 - 1.5);
-      steps = buddhabrot(c, t, 1024);
-      if (steps < 1024) {
-        for (int k = 0; k < steps - 1; k++) {
-          int x = (t[k].real() + 2.25) / 3 * 512;
-          int y = (t[k].imag() + 1.5) / 3 * 512;
-          if (x > 0 && x < 512 && y > 0 && y < 512)
-            img[((512 - x) * 512 + y) * 3 + 0]++;
+      int cr = buddhabrot(c, r, sr);
+      int cg = buddhabrot(c, g, sg);
+      int cb = buddhabrot(c, b, sb);
+      for (int k = 0; k < 2048; k++) {
+        if (cr < sr && k < cr) {
+          int x = (r[k].real() + 2.25) / 3 * 512;
+          int y = (r[k].imag() + 1.5) / 3 * 512;
+          if (x > 0 && x < 512 && y > 0 && y < 512) {
+            int c = ++img[((512 - x) * 512 + y) * 3 + 0];
+            if (max_r < c) max_r = c;
+          }
+        }
+        if (cg < sg && k < cg) {
+          int x = (g[k].real() + 2.25) / 3 * 512;
+          int y = (g[k].imag() + 1.5) / 3 * 512;
+          if (x > 0 && x < 512 && y > 0 && y < 512) {
+            int c = ++img[((512 - x) * 512 + y) * 3 + 1];
+            if (max_g < c) max_g = c;
+          }
+        }
+        if (cb < sb && k < cb) {
+          int x = (b[k].real() + 2.25) / 3 * 512;
+          int y = (b[k].imag() + 1.5) / 3 * 512;
+          if (x > 0 && x < 512 && y > 0 && y < 512) {
+            int c = ++img[((512 - x) * 512 + y) * 3 + 2];
+            if (max_b < c) max_b = c;
+          }
         }
       }
     }
+#endif
+
+#ifdef GPU
+    cl_float2 points[2048];
+    int output_steps_data[2048];
+    int limit;
+    const size_t limit_r = 512;
+    const size_t limit_g = 1024;
+    const size_t limit_b = 2048;
     for (int j = 0; j < 512; j++) {
-      std::complex<float> t[4096];
       float ri = i + (rand() * 1. / RAND_MAX - 0.5); // rand() % 512;
       float rj = j + (rand() * 1. / RAND_MAX - 0.5); // rand() % 512;
-      int steps;
-      std::complex<float> c = std::complex<float>(rj / 512. * 3 - 2.25, ri / 512. * 3 - 1.5);
-      steps = buddhabrot(c, t, 2048);
-      if (steps < 2048) {
-        for (int k = 0; k < steps - 1; k++) {
-          int x = (t[k].real() + 2.25) / 3 * 512;
-          int y = (t[k].imag() + 1.5) / 3 * 512;
-          if (x > 0 && x < 512 && y > 0 && y < 512)
-            img[((512 - x) * 512 + y) * 3 + 1]++;
+      points[j] = {rj / 512.f * 3 - 2.25f, ri / 512.f * 3 - 1.5f};
+    }
+
+    clEnqueueWriteBuffer(queue, input_c, CL_FALSE, 0, sizeof(cl_float2) * 512, points, 0, NULL, NULL);
+
+    limit = 512;
+    clSetKernelArg(kernel, 1, sizeof(int), &limit);
+    clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &limit_r, NULL, 0, NULL, NULL);
+    clEnqueueReadBuffer(queue, output_steps, CL_FALSE, 0, sizeof(int) * 512, output_steps_data, 0, NULL, NULL);
+    clEnqueueReadBuffer(queue, output_results, CL_FALSE, 0, sizeof(cl_float2) * limit * 512, output_results_data, 0, NULL, NULL);
+    clFinish(queue);
+    for (int j = 0; j < 512; j++) {
+      int steps = output_steps_data[j];
+      if (steps >= limit) continue;
+      for (int k = 0; k < steps; k++) {
+        int x = (output_results_data[j * limit + k].x + 2.25) / 3 * 512;
+        int y = (output_results_data[j * limit + k].y + 1.5) / 3 * 512;
+        if (x > 0 && x < 512 && y > 0 && y < 512) {
+          int c = ++img[((512 - x) * 512 + y) * 3 + 0];
+          if (max_r < c) max_r = c;
         }
       }
     }
+
+    limit = 1024;
+    clSetKernelArg(kernel, 1, sizeof(int), &limit);
+    clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &limit_g, NULL, 0, NULL, NULL);
+    clEnqueueReadBuffer(queue, output_steps, CL_FALSE, 0, sizeof(int) * 512, output_steps_data, 0, NULL, NULL);
+    clEnqueueReadBuffer(queue, output_results, CL_FALSE, 0, sizeof(cl_float2) * limit * 512, output_results_data, 0, NULL, NULL);
+    clFinish(queue);
     for (int j = 0; j < 512; j++) {
-      std::complex<float> t[4096];
-      float ri = i + (rand() * 1. / RAND_MAX - 0.5); // rand() % 512;
-      float rj = j + (rand() * 1. / RAND_MAX - 0.5); // rand() % 512;
-      int steps;
-      std::complex<float> c = std::complex<float>(rj / 512. * 3 - 2.25, ri / 512. * 3 - 1.5);
-      steps = buddhabrot(c, t, 4096);
-      if (steps < 4096) {
-        for (int k = 0; k < steps - 1; k++) {
-          int x = (t[k].real() + 2.25) / 3 * 512;
-          int y = (t[k].imag() + 1.5) / 3 * 512;
-          if (x > 0 && x < 512 && y > 0 && y < 512)
-            img[((512 - x) * 512 + y) * 3 + 2]++;
+      int steps = output_steps_data[j];
+      if (steps >= limit) continue;
+      for (int k = 0; k < steps; k++) {
+        int x = (output_results_data[j * limit + k].x + 2.25) / 3 * 512;
+        int y = (output_results_data[j * limit + k].y + 1.5) / 3 * 512;
+        if (x > 0 && x < 512 && y > 0 && y < 512) {
+          int c = ++img[((512 - x) * 512 + y) * 3 + 1];
+          if (max_g < c) max_g = c;
         }
       }
     }
+
+    limit = 2048;
+    clSetKernelArg(kernel, 1, sizeof(int), &limit);
+    clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &limit_b, NULL, 0, NULL, NULL);
+    clEnqueueReadBuffer(queue, output_steps, CL_FALSE, 0, sizeof(int) * 512, output_steps_data, 0, NULL, NULL);
+    clEnqueueReadBuffer(queue, output_results, CL_FALSE, 0, sizeof(cl_float2) * limit * 512, output_results_data, 0, NULL, NULL);
+    clFinish(queue);
+    for (int j = 0; j < 512; j++) {
+      int steps = output_steps_data[j];
+      if (steps >= limit) continue;
+      for (int k = 0; k < steps; k++) {
+        int x = (output_results_data[j * limit + k].x + 2.25) / 3 * 512;
+        int y = (output_results_data[j * limit + k].y + 1.5) / 3 * 512;
+        if (x > 0 && x < 512 && y > 0 && y < 512) {
+          int c = ++img[((512 - x) * 512 + y) * 3 + 2];
+          if (max_b < c) max_b = c;
+        }
+      }
+    }
+#endif
+
     i = (i + 1) % 512;
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 512, 512, 0, GL_RGB, GL_UNSIGNED_BYTE, img);
+    for (int j = 0; j < 512 * 512 * 3; j++) {
+      float m;
+      switch (j % 3) {
+        case 0: m = max_r; break;
+        case 1: m = max_g; break;
+        case 2: m = max_b; break;
+      }
+      img_[j] = img[j] / m;
+      if (j / 3 % 512 == i) {
+        img_[j] = 0.5;
+      }
+    }
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 512, 512, 0, GL_RGB, GL_FLOAT, img_);
     glDrawArrays(GL_TRIANGLES, 0, 6);
     glfwSwapBuffers(window);
     glfwPollEvents();
