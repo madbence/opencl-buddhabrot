@@ -5,7 +5,15 @@
 ## build
 
 ```sh
-$ g++ -lOpenCL -lGLEW -lglfw -lGL main.c
+$ make
+```
+
+## run
+
+```sh
+$ ./mandelbrot
+$ ./buddhabrot-cpu
+$ ./buddhabrot-gpu
 ```
 
 ## license
