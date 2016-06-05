@@ -1,6 +1,6 @@
 # opencl-buddhabrot
 
-> WIP
+![example](example.gif)
 
 ## build
 
